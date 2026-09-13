@@ -1,0 +1,99 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-unstable
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.result.outputs.commit }}
+      changed: ${{ steps.result.outputs.changed }}
+    steps:
+      - name: Checkout unstable
+        uses: actions/checkout@v4
+        with:
+          ref: unstable
+          fetch-depth: 0
+
+      - name: Save downstream overlay
+        run: |
+          OVERLAY_ARCHIVE="${RUNNER_TEMP}/axonhub-downstream.tar"
+          git archive --format=tar --output="$OVERLAY_ARCHIVE" HEAD .downstream
+          printf 'OVERLAY_ARCHIVE=%s\n' "$OVERLAY_ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Record origin baseline
+        id: baseline
+        run: |
+          OLD_SHA="$(git ls-remote --heads origin unstable)"
+          OLD_SHA="${OLD_SHA%%$'\t'*}"
+          printf 'old_sha=%s\n' "$OLD_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Add or update upstream remote
+        run: |
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/looplj/axonhub.git
+          else
+            git remote add upstream https://github.com/looplj/axonhub.git
+          fi
+
+      - name: Fetch upstream unstable
+        run: git fetch --no-tags upstream unstable
+
+      - name: Reset to upstream and re-apply overlay
+        id: result
+        env:
+          OLD_SHA: ${{ steps.baseline.outputs.old_sha }}
+        run: |
+          CHANGED=false
+
+          if git merge-base --is-ancestor upstream/unstable HEAD; then
+            printf 'upstream/unstable is already contained in HEAD; checking overlay drift.\n'
+          else
+            printf 'New upstream commits found; resetting before restoring the overlay.\n'
+            git reset --hard upstream/unstable
+            git clean -fdx
+            tar -xf "$OVERLAY_ARCHIVE" -C .
+          fi
+
+          bash .downstream/apply.sh
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            git add -A
+            git commit -m "sync: upstream/unstable"
+            if [[ -z "$OLD_SHA" ]]; then
+              printf 'origin/unstable has no baseline; refusing to overwrite it.\n' >&2
+              exit 1
+            fi
+            git push --force-with-lease="refs/heads/unstable:${OLD_SHA}" origin HEAD:unstable
+            CHANGED=true
+          fi
+
+          printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          printf 'changed=%s\n' "$CHANGED" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish synced unstable image
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      ref: ${{ needs.sync.outputs.commit }}
+    secrets: inherit
+    permissions:
+      contents: read
+      packages: write

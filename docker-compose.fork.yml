@@ -1,0 +1,3 @@
+services:
+  axonhub:
+    image: ghcr.io/${COMPOSE_IMAGE_OWNER:-floretteee}/axonhub:${COMPOSE_IMAGE_TAG:-unstable}
